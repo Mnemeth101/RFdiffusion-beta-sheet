@@ -386,6 +386,37 @@ Alternatively, you could specify `contigmap.inpaint_str_helix` to make it a heli
 
 See the example in `examples/design_ppi_flexible_peptide_with_secondarystructure_specification.sh`.
 
+In [Sappington et al., 2024](https://www.biorxiv.org/content/10.1101/2024.10.11.617496v2), the authors demonstrating using RFdiffusion to design binders with specified beta-strand interactions with a target beta strand. This capability is useful for targeting exposed beta-strands on protein surfaces with high specificity. This is implemented by modifying the secondary structure and block adjacency of the binder to match the target beta strand.
+
+To design a protein that binds to a target through a beta-strand interaction, you can use the following configuration options:
+
+```
+scripts/run_inference.py \
+  inference.output_prefix="$OUTPUT_DIR" \
+  inference.input_pdb="$INPUT_PDB" \
+  inference.num_designs=1 \
+  ppi.hotspot_res="[A5,A6,A7,A8,A9,A10]" \
+  scaffoldguided.scaffoldguided=True \
+  scaffoldguided.target_pdb=True \
+  scaffoldguided.target_path="$INPUT_PDB" \
+  scaffoldguided.set_binder_beta_sheet_length=6 \
+  scaffoldguided.set_target_beta_sheet="[A5-10/0]" \
+  scaffoldguided.flexible_beta_sheet=False \
+  scaffoldguided.target_ss="$INPUT_SS" \
+  scaffoldguided.target_adj="$INPUT_ADJ" \
+  diffuser.partial_T=10 \
+  logging.save_ss_adj=True
+```
+
+Key parameters for beta-sheet targeting:
+
+- `scaffoldguided.set_binder_beta_sheet_length`: Specifies the length of the beta-strand in the designed binder that will pair with the target
+- `scaffoldguided.set_target_beta_sheet`: Defines which residues in the target protein form the beta-strand to be targeted (`[A5-10/0]` indicates residues 5-10 in chain A)
+- `scaffoldguided.flexible_beta_sheet`: When set to `True`, allows for a bit more flexibility in the design of the beta-sheet between the binder and target
+- `scaffoldguided.target_ss`: Secondary structure of the target protein. This can be generated using `helper_scripts/make_secstruc_adj.py`
+- `scaffoldguided.target_adj`: Block adjacency of the target protein. This can be generated using `helper_scripts/make_secstruc_adj.py`
+
+You can find a complete example script in `./examples/design_beta_sheet_targeting.sh`.
 
 ---
 
