@@ -8,6 +8,7 @@ from scipy.spatial.transform import Rotation as scipy_R
 from rfdiffusion.util import rigid_from_3_points
 from rfdiffusion.util_module import ComputeAllAtomCoords
 from rfdiffusion import util
+from rfdiffusion.contigs import ContigMap
 import random
 import logging
 from rfdiffusion.inference import model_runners
@@ -659,7 +660,145 @@ def get_idx0_hotspots(mappings, ppi_conf, binderlen):
                     hotspot_idx.append(mappings["receptor_con_hal_idx0"][i])
     return hotspot_idx
 
+def contig_indexed_residues_to_idx0(target_pdb, contig):
+    """
+    Take pdb-indexed residues and the mappings of a PDB object, and return the 0-indexed list of residues
 
+    Args:
+        target_pdb: PDB object from parse_pdb
+        contig: Contig object (eg. B15-20 for residues 15-20 of chain B)
+    Returns:
+        List of 0-indexed residues (eg. [114, 115, 116, 117, 118, 119] in the above example if length of contig A is 100)
+    """
+    contigs = ContigMap(target_pdb, contig)
+    mappings = contigs.get_mappings()
+    contig_idx0 = mappings["receptor_con_hal_idx0"]
+    return contig_idx0
+
+def encode_beta_strand_adjacency(full_adj, binderlen, target_beta_sheet_idx0, binder_beta_sheet_init_position, binder_beta_sheet_length, flexible=False):
+    """
+    Implementing the beta-strand targeting logic as in Sappington et al. 2024
+    Update the adjacency matrix to encode for beta strand contacts between the binder and target beta sheets.
+    Since beta sheets are long, the residues are not all in contact with each other. For this, we will set contacts for a residue 
+    on a given beta strand as in contact with corresponding and adjacent residues on the other beta strand.
+    
+    The connectivity pattern between two beta strands looks like this, where each residue connects
+    to its matching residue on the opposite strand plus adjacent residues:
+    
+    Binder:   R1 --- R2 --- R3 --- R4 --- R5  (one beta strand)
+              |\    /|\    /|\    /|\    /|
+              | \  / | \  / | \  / | \  / |
+              |  \/  |  \/  |  \/  |  \/  |
+              |  /\  |  /\  |  /\  |  /\  |
+              | /  \ | /  \ | /  \ | /  \ |
+              |/    \|/    \|/    \|/    \|
+    Target:   R6 --- R7 --- R8 --- R9 --- R10 (opposite beta strand)
+    
+    Each residue connects to its direct partner plus its neighbors. For example:
+    - R3 connects to [R7, R8, R9] (previous, matching, and next)
+    - R8 connects to [R2, R3, R4] (previous, matching, and next)
+
+    The function first determines the "effective beta length" as the minimum length of both beta sheets,
+    then creates contacts between matching positions and their adjacent neighbors.
+    
+    For example, with binderlen = 6, targetlen = 6:
+    - Assuming the binder beta sheet positions are [1, 2, 3] (length 3)
+    - And the target beta sheet positions are [8, 9] (length 2)
+    
+    The effective_beta_length would be min(3, 2) = 2, so we only use the first 2 positions from each beta sheet.
+    The matching positions would be:
+    - Binder position 1 matches with target position 8
+    - Binder position 2 matches with target position 9
+    - Binder position 3 is not used because it exceeds the effective beta length
+    
+    The contacts created would be:
+    - From binder position 1 to target positions: [8, 9] (its match and next)
+    - From binder position 2 to target positions: [8, 9] (previous and its match)
+    - From target position 8 to binder positions: [1, 2] (its match and next)
+    - From target position 9 to binder positions: [1, 2] (previous and its match)
+    
+    This results in an adjacency matrix that looks like:
+    (Labeling intra-protein contacts as _ for clarity and 0 where there is no contact)
+    [_, _, _, _, _, _, 0, 0, 0, 0, 0, 0]
+    [_, _, _, _, _, _, 0, 0, 1, 1, 0, 0] (binder position 1 matches with target positions 8, 9)
+    [_, _, _, _, _, _, 0, 0, 1, 1, 0, 0] (binder position 2 matches with target positions 8, 9)
+    [_, _, _, _, _, _, 0, 0, 0, 0, 0, 0] (binder position 3 not used - exceeds effective beta length)
+    [_, _, _, _, _, _, 0, 0, 0, 0, 0, 0]
+    [_, _, _, _, _, _, 0, 0, 0, 0, 0, 0]
+    [ 0, 0, 0, 0, 0, 0, _, _, _, _, _, _]
+    [ 0, 0, 0, 0, 0, 0, _, _, _, _, _, _]
+    [ 0, 1, 1, 0, 0, 0, _, _, _, _, _, _] (target position 8 matches with binder positions 1, 2)
+    [ 0, 1, 1, 0, 0, 0, _, _, _, _, _, _] (target position 9 matches with binder positions 1, 2)
+    [ 0, 0, 0, 0, 0, 0, _, _, _, _, _, _]
+    [ 0, 0, 0, 0, 0, 0, _, _, _, _, _, _]
+    Args:
+        full_adj: Full adjacency matrix of shape (L, L, 3), where L = L_binderlength + L_targetlength. 
+                  The binder adjacency matrix is contained in [0:binderlen, 0:binderlen], and the target
+                  adjacency matrix is contained in [binderlen:, binderlen:]. The interactions between the
+                  binder and target are contained in [0:binderlen, binderlen:] and [binderlen:, 0:binderlen].
+                  The adjacency matrix is one-hot encoded, with 0s where there is no contact, 1 where there is
+                  contact, and 2 where there is a mask. It is implemented as a one-hot vector, so instead of {0,1,2}
+                  each position is a one-hot vector of length 3, where no contact is [1,0,0], contact is [0,1,0],
+                  and mask is [0,0,1]. Full-adj should be initialized as masks, so the input full_adj should be
+                  of shape (L, L, 3) with all values set to [0,0,1].
+        binderlen: Length of the binder.
+        target_beta_sheet_idx0: List of 0-indexed residues in the target beta sheet.
+        binder_beta_sheet_init_position: The 0-indexed position of the first residue in the binder beta sheet.
+        binder_beta_sheet_length: The length of the binder beta sheet.
+        flexible: If True, contacts are added with 0.6 probability for more flexible beta sheet designs. Default: False.
+                 NOTE: This option is experimental and untested.
+    """
+    # 1. Create the binder beta sheet positions
+    binder_positions = list(range(binder_beta_sheet_init_position, 
+                             binder_beta_sheet_init_position + binder_beta_sheet_length))
+    
+    # Determine the effective beta sheet length (minimum of binder and target beta sheet lengths)
+    effective_beta_length = min(len(binder_positions), len(target_beta_sheet_idx0))
+    
+    # Truncate both beta sheets to the effective length
+    binder_positions = binder_positions[:effective_beta_length]
+    target_positions = target_beta_sheet_idx0[:effective_beta_length]
+    target_positions_global = [pos + binderlen for pos in target_positions]
+    
+    # Create contact pairs between matching beta sheet positions
+    contact_pairs = []
+    
+    # Single loop over the effective beta length to create all contacts
+    for i in range(effective_beta_length):
+        binder_pos = binder_positions[i]
+        target_pos_global = target_positions_global[i]
+        
+        # For each position, create contacts with itself and adjacent positions
+        for offset in [-1, 0, 1]:
+            # Binder position to target positions (and adjacent)
+            target_idx = i + offset
+            if 0 <= target_idx < effective_beta_length:
+                contact_pairs.append((binder_pos, target_positions_global[target_idx]))
+                
+            # Target position to binder positions (and adjacent)
+            binder_idx = i + offset
+            if 0 <= binder_idx < effective_beta_length:
+                contact_pairs.append((binder_positions[binder_idx], target_pos_global))
+    
+    # 5. Update the full_adj matrix with the contacts
+    # Clone the input matrix to avoid modifying the original
+    updated_full_adj = full_adj.clone()
+    
+    # Set contacts in the adjacency matrix
+    contact_tensor = torch.tensor([0, 1, 0])
+    
+    for binder_pos, target_pos in contact_pairs:
+        # When flexible=True, only add contacts with 0.6 probability
+        if not flexible or random.random() < 0.6:
+            # Set contact between binder and target (forward direction)
+            updated_full_adj[binder_pos, target_pos] = contact_tensor
+            
+            # Set contact between target and binder (backward direction)
+            updated_full_adj[target_pos, binder_pos] = contact_tensor
+    
+    # 6. Return the updated adjacency matrix
+    return updated_full_adj
+        
 class BlockAdjacency:
     """
     Class for handling PPI design inference with ss/block_adj inputs.

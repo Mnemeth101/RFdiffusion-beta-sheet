@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 from rfdiffusion.RoseTTAFoldModel import RoseTTAFoldModule
 from rfdiffusion.kinematics import get_init_xyz, xyz_to_t2d
@@ -742,13 +743,22 @@ class ScaffoldedSampler(SelfConditioning):
         super().__init__(conf)
         # initialize BlockAdjacency sampling class
         if conf.scaffoldguided.scaffold_dir is None:
-            assert any(x is not None for x in (conf.contigmap.inpaint_str_helix, conf.contigmap.inpaint_str_strand, conf.contigmap.inpaint_str_loop))
+            # Check for configurations guiding binder structure, either through specifying
+            # 1. Secondary structure of the _target_ (inpaint_str_helix/strand/loop) as in Liu et al. 2024
+            # or 2. Secondary structure of the binder + binder-target adjacency as in Sappington et al. 2024
+            assert any(x is not None for x in (conf.contigmap.inpaint_str_helix, 
+                                               conf.contigmap.inpaint_str_strand, 
+                                               conf.contigmap.inpaint_str_loop,
+                                               conf.scaffoldguided.set_binder_beta_sheet_length,
+                                               conf.scaffoldguided.set_target_beta_sheet)), "You must provide at least one of inpaint_str_helix, inpaint_str_strand, inpaint_str_loop, set_binder_beta_sheet_length, or set_target_beta_sheet"
             if conf.contigmap.inpaint_str_loop is not None:
                 assert conf.scaffoldguided.mask_loops == False, "You shouldn't be masking loops if you're specifying loop secondary structure"
+            print("No scaffold_dir provided.")
         else:
             # initialize BlockAdjacency sampling class
             assert all(x is None for x in (conf.contigmap.inpaint_str_helix, conf.contigmap.inpaint_str_strand, conf.contigmap.inpaint_str_loop)), "can't provide scaffold_dir if you're also specifying per-residue ss"
-            self.blockadjacency = iu.BlockAdjacency(conf.scaffoldguided, conf.inference.num_designs)
+            self.blockadjacency = iu.BlockAdjacency(conf, conf.inference.num_designs)
+            print("Scaffold_dir provided. Setting up BlockAdjacency (which uses existing scaffolds).")
 
 
         #################################################
@@ -784,6 +794,23 @@ class ScaffoldedSampler(SelfConditioning):
         if hasattr(self, 'blockadjacency'):
             self.L, self.ss, self.adj = self.blockadjacency.get_scaffold()
             self.adj = nn.one_hot(self.adj.long(), num_classes=3)
+        elif self._conf.scaffoldguided.set_binder_beta_sheet_length is not None:
+            # Initializing a random scaffold with a single beta sheet of length L, as in Sappington et al. 2024
+            L = self._conf.scaffoldguided.set_binder_beta_sheet_length
+            print("Initializing scaffold with beta sheet of length", L)
+            self.L = 100
+            # Create one-hot encoded secondary structure tensor of shape (L, 4) 
+            # where columns represent helix (0), strand (1), loop (2), mask (3)
+            self.ss = torch.zeros((self.L, 4))
+            self.ss[:, 3] = 1  # Set all to mask initially
+            # Set a random set of residues to be beta sheets, with length given by set_binder_beta_length
+            self.binder_beta_sheet_init_position = torch.randint(0, self.L - L + 1, (1,)).item()
+            
+            # Mark the beta sheet positions (column 1 for strand)
+            self.ss[self.binder_beta_sheet_init_position:self.binder_beta_sheet_init_position + L, 1] = 1
+            self.ss[self.binder_beta_sheet_init_position:self.binder_beta_sheet_init_position + L, 3] = 0  # Remove mask
+            self.adj = torch.zeros((self.L, self.L, 3))
+            self.adj[:, :, 2] = 1  # Set the third channel (mask) to 1
         else:
             self.L=100 # shim. Get's overwritten
 
@@ -960,6 +987,14 @@ class ScaffoldedSampler(SelfConditioning):
                 full_adj[:self.binderlen, :self.binderlen] = self.adj
                 if self._conf.scaffoldguided.target_adj is not None:
                     full_adj[self.binderlen:,self.binderlen:] = self.target_adj
+                if self._conf.scaffoldguided.set_target_beta_sheet is not None:
+                    # Implementing the beta-strand targeting logic as in Sappington et al. 2024
+                    # set_target_beta_sheet denotes the beta sheet residues in the target which are going to be set as contact pairs for the binder.
+                    # set_target_beta_sheet should follow the normal contig numbering scheme: eg. B15-20
+                    assert (self.binder_beta_sheet_init_position is not None) and (self._conf.scaffoldguided.set_binder_beta_sheet_length is not None), "Must provide binder_beta_sheet_init_position and set_binder_beta_sheet_length if using set_target_beta_sheet"
+                    target_beta_sheet_idx0 = iu.contig_indexed_residues_to_idx0(self.target_pdb, self._conf.scaffoldguided.set_target_beta_sheet)
+                    flexible_beta_sheet = self._conf.scaffoldguided.flexible_beta_sheet if hasattr(self._conf.scaffoldguided, 'flexible_beta_sheet') else None
+                    full_adj = iu.encode_beta_strand_adjacency(full_adj, self.binderlen, target_beta_sheet_idx0, self.binder_beta_sheet_init_position, self._conf.scaffoldguided.set_binder_beta_sheet_length, flexible_beta_sheet)
             else:
                 full_adj = self.adj
             t2d=torch.cat((t2d, full_adj[None,None].to(self.device)),dim=-1)
@@ -970,5 +1005,78 @@ class ScaffoldedSampler(SelfConditioning):
 
         if self.target:
             idx_pdb[:,self.binderlen:] += 200
+            
+        ###################################
+        ### Save Matrices to CSV Files  ###
+        ###################################
+        if self._conf.logging.save_ss_adj:
+            # Create output directory if it doesn't exist
+            output_dir = os.path.join(self._conf.inference.output_prefix, 'ss_adj_outputs')
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Get timestep for unique filenames
+            timestep = int(t.item()) if isinstance(t, torch.Tensor) else t
+            
+            # Save secondary structure to CSV
+            if 'full_ss' in locals():
+                ss_path = os.path.join(output_dir, f'secondary_structure_t{timestep}.csv')
+                ss_np = full_ss.cpu().numpy()
+                # Convert one-hot encoding to categorical values: 0=helix, 1=strand, 2=loop, 3=mask
+                ss_categories = np.argmax(ss_np, axis=1)
+                
+                # Create a DataFrame with just residue index and category
+                ss_df = pd.DataFrame({
+                    'residue_idx': range(len(ss_categories)),
+                    'ss_category': ss_categories
+                })
+                
+                # Save to CSV
+                ss_df.to_csv(ss_path, index=False)
+                
+                # Inject the legend at the beginning of the CSV
+                with open(ss_path, 'r') as f:
+                    lines = f.readlines()
+                with open(ss_path, 'w') as f:
+                    f.write("0 = Helix (H)\n")
+                    f.write("1 = Strand (E)\n")
+                    f.write("2 = Loop (L)\n")
+                    f.write("3 = Mask (M)\n")
+                    f.writelines(lines)
+                    
+                print(f"Saved secondary structure to {ss_path}")
+            
+            # Save adjacency matrix to CSV
+            if 'full_adj' in locals() and hasattr(self, 'd_t2d') and self.d_t2d == 47:
+                adj_path = os.path.join(output_dir, f'adjacency_matrix_t{timestep}.csv')
+                adj_np = full_adj.cpu().numpy()
+                
+                # Convert one-hot encoding to categorical values: 0=not adjacent, 1=adjacent, 2=mask
+                # This creates a 2D matrix representation of the adjacency data
+                adj_categories = np.argmax(adj_np, axis=2)
+                
+                # Create a DataFrame with the 2D matrix
+                # Each row and column represents a residue
+                # Each cell contains 0 (not adjacent), 1 (adjacent), or 2 (mask)
+                adj_df = pd.DataFrame(adj_categories)
+                
+                # Add column names as residue indices
+                adj_df.columns = [f'residue_{i}' for i in range(adj_categories.shape[1])]
+                
+                # Add row names as residue indices
+                adj_df.index = [f'residue_{i}' for i in range(adj_categories.shape[0])]
+                
+                # Save to CSV
+                adj_df.to_csv(adj_path)
 
+                # Inject in the first line of the CSV the one-hot encoding rule of the adjacency matrix
+                with open(adj_path, 'r') as f:
+                    lines = f.readlines()
+                with open(adj_path, 'w') as f:
+                    f.write("0 = Not adjacent (no beta strand contact)\n")
+                    f.write("1 = Adjacent (beta strand contact)\n")
+                    f.write("2 = Mask (no specific relationship defined)\n")
+                    f.writelines(lines)
+                
+                print(f"Saved adjacency matrix to {adj_path}")
+        
         return msa_masked, msa_full, seq, xyz_prev, idx_pdb, t1d, t2d, xyz_t, alpha_t

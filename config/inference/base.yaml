@@ -122,7 +122,8 @@ preprocess:
   
 logging:
   inputs: False
-
+  save_ss_adj: False
+  
 scaffoldguided:
   scaffoldguided: False
   target_pdb: False
@@ -138,3 +139,6 @@ scaffoldguided:
   target_adj: null
   mask_loops: True
   contig_crop: null
+  set_binder_beta_sheet_length: null
+  set_target_beta_sheet: null
+  flexible_beta_sheet: False
