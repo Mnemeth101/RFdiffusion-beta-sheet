@@ -798,7 +798,42 @@ def encode_beta_strand_adjacency(full_adj, binderlen, target_beta_sheet_idx0, bi
     
     # 6. Return the updated adjacency matrix
     return updated_full_adj
+
+def ignore_target_residues(full_adj, binderlen, target_ignore_idx0):
+    """
+    Update the adjacency matrix to forcibly ignore interactions between the binder and specific target residues.
+    This sets all binder-target interactions involving the specified target residues to "no contact".
+    
+    Args:
+        full_adj: Full adjacency matrix of shape (L, L, 3), where L = binderlen + targetlen.
+                  The adjacency matrix is one-hot encoded with [1,0,0] = no contact, 
+                  [0,1,0] = contact, [0,0,1] = mask.
+        binderlen: Length of the binder.
+        target_ignore_idx0: List of 0-indexed residues in the target to ignore interactions with.
+    
+    Returns:
+        updated_full_adj: Updated adjacency matrix with ignored target residues set to no contact.
+    """
+    # Clone the input matrix to avoid modifying the original
+    updated_full_adj = full_adj.clone()
+    
+    # Convert target 0-indexed positions to global positions in the full adjacency matrix
+    target_ignore_global_idx = [pos + binderlen for pos in target_ignore_idx0]
+    
+    # Set "no contact" tensor [1,0,0]
+    no_contact_tensor = torch.tensor([1, 0, 0])
+    
+    # For each target residue to ignore
+    for target_pos in target_ignore_global_idx:
+        # Set all binder-target interactions to "no contact"
+        # Binder to target interactions: [0:binderlen, target_pos]
+        updated_full_adj[0:binderlen, target_pos] = no_contact_tensor
         
+        # Target to binder interactions: [target_pos, 0:binderlen]  
+        updated_full_adj[target_pos, 0:binderlen] = no_contact_tensor
+    
+    return updated_full_adj
+
 class BlockAdjacency:
     """
     Class for handling PPI design inference with ss/block_adj inputs.

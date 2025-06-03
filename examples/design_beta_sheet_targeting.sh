@@ -20,6 +20,7 @@ scripts/run_inference.py \
   scaffoldguided.target_path="$TARGET_PDB" \
   scaffoldguided.set_binder_beta_sheet_length=6 \
   scaffoldguided.set_target_beta_sheet="[A5-10/0]" \
+  scaffoldguided.ignore_target_residues="[A75-90/A161-167/0]" \
   scaffoldguided.flexible_beta_sheet=False \
   scaffoldguided.target_ss="$TARGET_SS" \
   scaffoldguided.target_adj="$TARGET_ADJ" \

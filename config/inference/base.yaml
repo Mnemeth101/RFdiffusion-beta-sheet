@@ -142,3 +142,4 @@ scaffoldguided:
   set_binder_beta_sheet_length: null
   set_target_beta_sheet: null
   flexible_beta_sheet: False
+  ignore_target_residues: null

@@ -995,6 +995,10 @@ class ScaffoldedSampler(SelfConditioning):
                     target_beta_sheet_idx0 = iu.contig_indexed_residues_to_idx0(self.target_pdb, self._conf.scaffoldguided.set_target_beta_sheet)
                     flexible_beta_sheet = self._conf.scaffoldguided.flexible_beta_sheet if hasattr(self._conf.scaffoldguided, 'flexible_beta_sheet') else None
                     full_adj = iu.encode_beta_strand_adjacency(full_adj, self.binderlen, target_beta_sheet_idx0, self.binder_beta_sheet_init_position, self._conf.scaffoldguided.set_binder_beta_sheet_length, flexible_beta_sheet)
+                # TODO: if user requests to forcibly ignore specific target residues, update the adjacency matrix to set interactions with the binder to those residues to 0
+                if self._conf.scaffoldguided.ignore_target_residues is not None:
+                    target_ignore_idx0 = iu.contig_indexed_residues_to_idx0(self.target_pdb, self._conf.scaffoldguided.ignore_target_residues)
+                    full_adj = iu.ignore_target_residues(full_adj, self.binderlen, target_ignore_idx0)
             else:
                 full_adj = self.adj
             t2d=torch.cat((t2d, full_adj[None,None].to(self.device)),dim=-1)
